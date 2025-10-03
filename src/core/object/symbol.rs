@@ -23,6 +23,7 @@ struct SymbolCellData {
     // https://github.com/crossbeam-rs/crossbeam/issues/748
     func: Option<AtomicPtr<u8>>,
     special: AtomicBool,
+    // Symbol properties are stored in the environment
 }
 
 #[derive(Debug)]
