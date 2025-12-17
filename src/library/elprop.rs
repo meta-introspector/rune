@@ -42,7 +42,6 @@ pub fn eval(lisp: &str) -> Result<String> {
 /// # use proptest::prelude::*;
 /// # fn arb_byte() -> impl Strategy<Value = u8> { any::<u8>() } // Mock `arb_byte` for example to compile
 /// proptest! {
-///     #[test]
 ///     fn check_make_vector_consistency(size in arb_byte()) {
 ///         assert_elprop!["(make-vector {} ?A)", size];
 ///     }

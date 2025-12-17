@@ -1,4 +1,4 @@
-#![allow(clippy::manual_unwrap_or_default)]
+#![allow(clippy::needless_continue)]
 // MIT License
 //
 // Copyright (c) 2020 Luke Roberts
