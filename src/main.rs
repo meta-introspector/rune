@@ -10,6 +10,7 @@ mod arith;
 mod buffer;
 mod bytecode;
 mod casefiddle;
+mod channels;
 mod character;
 mod chartab;
 mod data;
