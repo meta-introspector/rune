@@ -164,7 +164,7 @@ pub(crate) struct ChannelSender(pub(in crate::core) GcHeap<ChannelSenderInner>);
 derive_GcMoveable!(ChannelSender);
 
 pub(in crate::core) struct ChannelSenderInner {
-    state: Arc<SharedChannelState>,
+    pub(in crate::core) state: Arc<SharedChannelState>,
 }
 
 impl ChannelSender {
@@ -278,7 +278,7 @@ pub(crate) struct ChannelReceiver(pub(in crate::core) GcHeap<ChannelReceiverInne
 derive_GcMoveable!(ChannelReceiver);
 
 pub(in crate::core) struct ChannelReceiverInner {
-    state: Arc<SharedChannelState>,
+    pub(in crate::core) state: Arc<SharedChannelState>,
 }
 
 impl ChannelReceiver {

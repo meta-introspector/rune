@@ -173,6 +173,8 @@ mod tests {
         let _receiver = go_internal(cx.add("discarded"), cx);
         let _ = _receiver;
 
+        cx.garbage_collect(true);
+
         // Thread should complete normally even though receiver was dropped
         // Wait briefly to allow thread to attempt send
         std::thread::sleep(std::time::Duration::from_millis(50));
