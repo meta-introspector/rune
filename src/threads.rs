@@ -46,8 +46,9 @@ fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
     // Create a rendezvous channel (capacity 1) for the result
     let (sender, receiver) = make_channel_pair(1);
 
-    // Convert object to raw to send across thread boundary
-    let raw_obj = obj.into_raw();
+    let (init_sender, init_receiver) = make_channel_pair(1);
+    init_sender.send(obj).expect("channel is immediately used after creation");
+    init_sender.close();
 
     // Spawn thread to evaluate expression
     crate::debug::enable_debug();
@@ -59,7 +60,8 @@ fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
         root!(env, new(Env), cx);
 
         // Reconstruct the object from raw
-        let obj = unsafe { Object::from_raw(raw_obj) };
+        let obj = init_receiver.recv(cx).expect("go_internal parent thread waited on the send operation in this channel before spawning the thread");
+        init_receiver.close();
         root!(obj, cx);
 
         // Evaluate expression and create result
@@ -77,9 +79,8 @@ fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
         // and will be double-copied: once into channel's buffer_block,
         // then once into receiver's context when received
         let _ = sender.send(result);
-
-        // TODO: Investigate if Context taking ownership of the block
-        // will properly clean everything up when the thread exits
+        sender.close();
+        cx.garbage_collect(true);
     });
 
     // Return the receiver to the caller
@@ -179,6 +180,7 @@ mod tests {
         // Wait briefly to allow thread to attempt send
         std::thread::sleep(std::time::Duration::from_millis(50));
 
+        cx.garbage_collect(true);
         // If we get here without panic, test passes
     }
 }
