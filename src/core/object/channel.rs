@@ -16,10 +16,7 @@ use crate::{
 use std::{
     collections::VecDeque,
     fmt,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -65,16 +62,27 @@ impl From<RecvError> for Symbol<'static> {
     }
 }
 
-/// The actual buffer protected by the mutex
+/// The actual channel state protected by the mutex
 #[derive(Debug)]
-pub(in crate::core) struct ChannelBuffer {
+pub(in crate::core) struct ChannelState {
     queue: VecDeque<Object<'static>>,
     capacity: usize,
+    sender_count: usize,
+    receiver_count: usize,
+    sender_closed: bool,
+    receiver_closed: bool,
 }
 
-impl ChannelBuffer {
+impl ChannelState {
     pub(in crate::core) fn new(capacity: usize) -> Self {
-        Self { queue: VecDeque::with_capacity(capacity), capacity }
+        Self {
+            queue: VecDeque::with_capacity(capacity),
+            capacity,
+            sender_count: 0,
+            receiver_count: 0,
+            sender_closed: false,
+            receiver_closed: false,
+        }
     }
 
     pub(in crate::core) fn is_empty(&self) -> bool {
@@ -117,37 +125,25 @@ impl ChannelBuffer {
 
 /// Shared state for a channel, stored in the global Block<true>
 pub(in crate::core) struct SharedChannelState {
-    pub(in crate::core) buffer: Mutex<Option<ChannelBuffer>>,
+    pub(in crate::core) state: Mutex<Option<ChannelState>>,
     pub(in crate::core) not_full: Condvar,
     pub(in crate::core) not_empty: Condvar,
-    pub(in crate::core) sender_count: AtomicUsize,
-    pub(in crate::core) receiver_count: AtomicUsize,
 }
 
 impl SharedChannelState {
     pub fn new(capacity: usize) -> Self {
         Self {
-            buffer: Mutex::new(Some(ChannelBuffer::new(capacity))),
+            state: Mutex::new(Some(ChannelState::new(capacity))),
             not_full: Condvar::new(),
             not_empty: Condvar::new(),
-            sender_count: AtomicUsize::new(0),
-            receiver_count: AtomicUsize::new(0),
         }
     }
 
-    fn has_senders(&self) -> bool {
-        self.sender_count.load(Ordering::Acquire) > 0
-    }
-
-    fn has_receivers(&self) -> bool {
-        self.receiver_count.load(Ordering::Acquire) > 0
-    }
-
     fn empty_buffer(&self) {
-        if let Some(mut buffer) = self.buffer.lock().unwrap().take() {
-            buffer.queue.drain(..);
-            // Buffer lock will be dropped here, then wake senders
-            drop(buffer);
+        if let Some(mut state) = self.state.lock().unwrap().take() {
+            state.queue.drain(..);
+            // State lock will be dropped here, then wake senders
+            drop(state);
         }
         self.not_full.notify_all();
     }
@@ -170,7 +166,9 @@ pub(in crate::core) struct ChannelSenderInner {
 
 impl ChannelSender {
     pub(in crate::core) fn new_with_state(state: Arc<SharedChannelState>, constant: bool) -> Self {
-        state.sender_count.fetch_add(1, Ordering::AcqRel);
+        if let Some(ref mut s) = *state.state.lock().unwrap() {
+            s.sender_count += 1;
+        }
         Self(GcHeap::new(ChannelSenderInner { state: Some(state) }, constant))
     }
 
@@ -186,25 +184,25 @@ impl ChannelSender {
         };
 
         loop {
-            let mut buffer_lock = state.buffer.lock().unwrap();
+            let mut state_lock = state.state.lock().unwrap();
 
-            let Some(buffer) = buffer_lock.as_mut() else {
+            let Some(ref mut s) = *state_lock else {
                 return Err(SendError::Closed);
             };
 
             // Check if receiver is closed
-            if !state.has_receivers() {
+            if s.receiver_count == 0 || s.receiver_closed {
                 return Err(SendError::Closed);
             }
 
-            if buffer.try_push(&obj).is_ok() {
-                drop(buffer_lock);
+            if s.try_push(&obj).is_ok() {
+                drop(state_lock);
                 state.not_empty.notify_one();
                 return Ok(());
             }
 
             // Wait for space
-            let _buffer = state.not_full.wait(buffer_lock).unwrap();
+            let _state = state.not_full.wait(state_lock).unwrap();
         }
     }
 
@@ -215,19 +213,19 @@ impl ChannelSender {
         let Some(state) = self.0.state.as_ref() else {
             return Err(SendError::Closed);
         };
-        let mut buffer_lock = state.buffer.lock().unwrap();
+        let mut state_lock = state.state.lock().unwrap();
 
-        let Some(buffer) = buffer_lock.as_mut() else {
+        let Some(ref mut s) = *state_lock else {
             return Err(SendError::Closed);
         };
 
         // Check if receiver is closed
-        if !state.has_receivers() {
+        if s.receiver_count == 0 || s.receiver_closed {
             return Err(SendError::Closed);
         }
 
-        if buffer.try_push(&obj).is_ok() {
-            drop(buffer_lock);
+        if s.try_push(&obj).is_ok() {
+            drop(state_lock);
             state.not_empty.notify_one();
             Ok(())
         } else {
@@ -251,19 +249,19 @@ impl ChannelSender {
         let deadline = start + timeout;
 
         loop {
-            let mut buffer_lock = state.buffer.lock().unwrap();
+            let mut state_lock = state.state.lock().unwrap();
 
-            let Some(buffer) = buffer_lock.as_mut() else {
+            let Some(ref mut s) = *state_lock else {
                 return Err(SendError::Closed);
             };
 
             // Check if receiver is closed
-            if !state.has_receivers() {
+            if s.receiver_count == 0 || s.receiver_closed {
                 return Err(SendError::Closed);
             }
 
-            if buffer.try_push(&obj).is_ok() {
-                drop(buffer_lock);
+            if s.try_push(&obj).is_ok() {
+                drop(state_lock);
                 state.not_empty.notify_one();
                 return Ok(());
             }
@@ -274,8 +272,8 @@ impl ChannelSender {
 
             let now = Instant::now();
             let remaining = deadline - now;
-            let result = state.not_full.wait_timeout(buffer_lock, remaining).unwrap();
-            let _buffer = result.0;
+            let result = state.not_full.wait_timeout(state_lock, remaining).unwrap();
+            let _state = result.0;
 
             if result.1.timed_out() {
                 return Err(SendError::Timeout);
@@ -287,11 +285,15 @@ impl ChannelSender {
     /// This wakes up any receivers waiting on recv() and causes them to return Err(RecvError::Closed).
     /// This is idempotent - calling close() multiple times has no additional effect.
     pub(crate) fn close(&self) {
-        if let Some(state) = self.0.state.as_ref() {
-            // Use fetch_sub instead of store(0) to be idempotent
-            let prev = state.sender_count.fetch_sub(1, Ordering::AcqRel);
-            if prev <= 1 {
+        if let Some(state) = self.0.state.as_ref()
+            && let Some(ref mut s) = *state.state.lock().unwrap()
+        {
+            if s.sender_count > 0 {
+                s.sender_count -= 1;
+            }
+            if s.sender_count == 0 {
                 state.not_empty.notify_all();
+                s.sender_closed = true;
             }
         }
     }
@@ -308,7 +310,9 @@ pub(in crate::core) struct ChannelReceiverInner {
 
 impl ChannelReceiver {
     pub(in crate::core) fn new_with_state(state: Arc<SharedChannelState>, constant: bool) -> Self {
-        state.receiver_count.fetch_add(1, Ordering::AcqRel);
+        if let Some(ref mut s) = *state.state.lock().unwrap() {
+            s.receiver_count += 1;
+        }
         Self(GcHeap::new(ChannelReceiverInner { state: Some(state) }, constant))
     }
 
@@ -324,26 +328,26 @@ impl ChannelReceiver {
         };
 
         loop {
-            let mut buffer_lock = state.buffer.lock().unwrap();
+            let mut state_lock = state.state.lock().unwrap();
 
-            let Some(buffer) = buffer_lock.as_mut() else {
+            let Some(ref mut s) = *state_lock else {
                 return Err(RecvError::Closed);
             };
 
-            if let Some(obj) = buffer.try_pop() {
-                drop(buffer_lock);
+            if let Some(obj) = s.try_pop() {
+                drop(state_lock);
                 state.not_full.notify_one();
                 let result = obj.clone_in(&cx.block);
                 return Ok(result);
             }
 
             // Check if all senders are closed
-            if !state.has_senders() {
+            if s.sender_count == 0 || s.sender_closed {
                 return Err(RecvError::Closed);
             }
 
             // Wait for data
-            let _buffer = state.not_empty.wait(buffer_lock).unwrap();
+            let _state = state.not_empty.wait(state_lock).unwrap();
         }
     }
 
@@ -354,18 +358,18 @@ impl ChannelReceiver {
         let Some(state) = self.0.state.as_ref() else {
             return Err(RecvError::Closed);
         };
-        let mut buffer_lock = state.buffer.lock().unwrap();
+        let mut state_lock = state.state.lock().unwrap();
 
-        let Some(buffer) = buffer_lock.as_mut() else {
+        let Some(ref mut s) = *state_lock else {
             return Err(RecvError::Closed);
         };
 
-        if let Some(obj) = buffer.try_pop() {
-            drop(buffer_lock);
+        if let Some(obj) = s.try_pop() {
+            drop(state_lock);
             state.not_full.notify_one();
             let result = obj.clone_in(&cx.block);
             Ok(result)
-        } else if !state.has_senders() {
+        } else if s.sender_count == 0 || s.sender_closed {
             Err(RecvError::Closed)
         } else {
             Err(RecvError::Empty)
@@ -387,21 +391,21 @@ impl ChannelReceiver {
         let deadline = start + timeout;
 
         loop {
-            let mut buffer_lock = state.buffer.lock().unwrap();
+            let mut state_lock = state.state.lock().unwrap();
 
-            let Some(buffer) = buffer_lock.as_mut() else {
+            let Some(ref mut s) = *state_lock else {
                 return Err(RecvError::Closed);
             };
 
-            if let Some(obj) = buffer.try_pop() {
-                drop(buffer_lock);
+            if let Some(obj) = s.try_pop() {
+                drop(state_lock);
                 state.not_full.notify_one();
                 let result = obj.clone_in(&cx.block);
                 return Ok(result);
             }
 
             // Check if all senders are closed
-            if !state.has_senders() {
+            if s.sender_count == 0 || s.sender_closed {
                 return Err(RecvError::Closed);
             }
 
@@ -411,8 +415,8 @@ impl ChannelReceiver {
 
             let now = Instant::now();
             let remaining = deadline - now;
-            let result = state.not_empty.wait_timeout(buffer_lock, remaining).unwrap();
-            let _buffer = result.0;
+            let result = state.not_empty.wait_timeout(state_lock, remaining).unwrap();
+            let _state = result.0;
 
             if result.1.timed_out() {
                 return Err(RecvError::Timeout);
@@ -428,9 +432,23 @@ impl ChannelReceiver {
     /// the original receiver can be closed after being cloned into a new context.
     pub(crate) fn close(&self) {
         if let Some(state) = self.0.state.as_ref() {
-            // Use fetch_sub instead of store(0) to be idempotent
-            let prev = state.receiver_count.fetch_sub(1, Ordering::AcqRel);
-            if prev <= 1 {
+            let should_empty = if let Some(ref mut s) = *state.state.lock().unwrap() {
+                if !s.receiver_closed {
+                    if s.receiver_count > 0 {
+                        s.receiver_count -= 1;
+                    }
+                    if s.receiver_count == 0 {
+                        s.receiver_closed = true;
+                    }
+                    s.receiver_count == 0
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_empty {
                 state.empty_buffer();
                 state.not_full.notify_all();
             }
@@ -452,11 +470,18 @@ pub(crate) fn make_channel_pair(capacity: usize) -> (ChannelSender, ChannelRecei
 impl Drop for ChannelSenderInner {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            let prev = state.sender_count.fetch_sub(1, Ordering::AcqRel);
-            // Use <= 1 to be idempotent
-            if prev <= 1 {
-                // Last sender dropped, wake up any waiting receivers
-                state.not_empty.notify_all();
+            if let Some(ref mut s) = *state.state.lock().unwrap() {
+                // Only decrement if not already closed (to avoid double-decrement)
+                if !s.sender_closed {
+                    if s.sender_count > 0 {
+                        s.sender_count -= 1;
+                    }
+                    if s.sender_count == 0 {
+                        s.sender_closed = true;
+                        // Last sender dropped, wake up any waiting receivers
+                        state.not_empty.notify_all();
+                    }
+                }
             }
             drop(state)
         }
@@ -466,9 +491,24 @@ impl Drop for ChannelSenderInner {
 impl Drop for ChannelReceiverInner {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            let prev = state.receiver_count.fetch_sub(1, Ordering::AcqRel);
-            // Use <= 1 to be idempotent (handles both last receiver and already-closed cases)
-            if prev <= 1 {
+            let should_empty = if let Some(ref mut s) = *state.state.lock().unwrap() {
+                // Only decrement if not already closed (to avoid double-decrement)
+                if !s.receiver_closed {
+                    if s.receiver_count > 0 {
+                        s.receiver_count -= 1;
+                    }
+                    if s.receiver_count == 0 {
+                        s.receiver_closed = true;
+                    }
+                    s.receiver_count == 0
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_empty {
                 state.empty_buffer();
                 state.not_full.notify_all();
             }
@@ -494,10 +534,7 @@ impl Trace for ChannelReceiverInner {
 impl<'new> CloneIn<'new, &'new Self> for ChannelSender {
     fn clone_in<const C: bool>(&self, _bk: &'new Block<C>) -> Gc<&'new Self> {
         let new_sender = match self.0.state.as_ref() {
-            Some(state) => {
-                state.sender_count.fetch_add(1, Ordering::AcqRel);
-                ChannelSender::new_with_state(state.clone(), false)
-            }
+            Some(state) => ChannelSender::new_with_state(state.clone(), false),
             None => ChannelSender::new_empty(false),
         };
 
@@ -509,10 +546,7 @@ impl<'new> CloneIn<'new, &'new Self> for ChannelSender {
 impl<'new> CloneIn<'new, &'new Self> for ChannelReceiver {
     fn clone_in<const C: bool>(&self, _bk: &'new Block<C>) -> Gc<&'new Self> {
         let new_receiver = match self.0.state.as_ref() {
-            Some(state) => {
-                state.receiver_count.fetch_add(1, Ordering::AcqRel);
-                ChannelReceiver::new_with_state(state.clone(), false)
-            }
+            Some(state) => ChannelReceiver::new_with_state(state.clone(), false),
             None => ChannelReceiver::new_empty(false),
         };
 
